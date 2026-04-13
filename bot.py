@@ -12,7 +12,7 @@ from telegram.ext import (
 )
 
 # =====================
-# CONFIG
+# 🔧 НАСТРОЙКИ
 # =====================
 
 TOKEN = os.getenv("TOKEN")
@@ -24,8 +24,10 @@ ADMIN_IDS = {465313785}
 TG_CHANNEL = "https://t.me/videt_i_slyshat"
 VK_PAGE = "https://vk.com/art_in_church"
 
+BACK_BTN = "🔙 Назад"
+
 # =====================
-# DB
+# 🗄 БАЗА
 # =====================
 
 conn = sqlite3.connect("quiz.db", check_same_thread=False)
@@ -46,8 +48,7 @@ CREATE TABLE IF NOT EXISTS questions (
     question TEXT,
     options TEXT,
     answer TEXT,
-    photo TEXT,
-    position INTEGER DEFAULT 0
+    photo TEXT
 )
 """)
 
@@ -62,22 +63,22 @@ CREATE TABLE IF NOT EXISTS stats (
 conn.commit()
 
 # =====================
-# STATE
+# 🧠 STATE
 # =====================
 
 USER = {}
 ADMIN = {}
 
 # =====================
-# HELPERS
+# 🧰 HELPERS
 # =====================
-
-def is_admin(uid):
-    return uid in ADMIN_IDS
-
 
 def get_text(update):
     return update.message.text.strip() if update.message and update.message.text else None
+
+
+def is_admin(uid):
+    return uid in ADMIN_IDS
 
 
 def get_quizzes():
@@ -86,28 +87,47 @@ def get_quizzes():
 
 def get_questions(qid):
     return conn.execute(
-        "SELECT * FROM questions WHERE quiz_id=? ORDER BY position",
+        "SELECT * FROM questions WHERE quiz_id=?",
         (qid,)
     ).fetchall()
 
 
 # =====================
-# START
+# /start
 # =====================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    qs = get_quizzes()
+    quizzes = get_quizzes()
 
-    if not qs:
-        await update.message.reply_text("❌ Викторин пока нет")
+    if not quizzes:
+        await update.message.reply_text("❌ Нет викторин")
         return
 
-    kb = [[f"{q['id']} - {q['name']}"] for q in qs]
+    kb = [[f"{q['id']} - {q['name']}"] for q in quizzes]
 
     await update.message.reply_text(
         "📚 Выберите викторину:",
         reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True)
     )
+
+
+# =====================
+# BACK
+# =====================
+
+async def go_back(update, context):
+    uid = update.effective_user.id
+
+    if uid in USER:
+        USER.pop(uid, None)
+        await update.message.reply_text("↩ Возврат в меню", reply_markup=ReplyKeyboardRemove())
+        await start(update, context)
+        return
+
+    if uid in ADMIN:
+        ADMIN.pop(uid, None)
+        await update.message.reply_text("↩ Выход из админки")
+        return
 
 
 # =====================
@@ -118,39 +138,49 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     text = get_text(update)
 
-    if uid in ADMIN:
-        await admin_router(update)
+    if not text:
         return
 
-    # выбор викторины
+    if text == BACK_BTN:
+        await go_back(update, context)
+        return
+
+    if uid in ADMIN:
+        await admin_router(update, context)
+        return
+
     if uid not in USER:
-        if text and " - " in text:
-            quiz_id = int(text.split(" - ")[0])
+        if " - " in text:
+            try:
+                quiz_id = int(text.split(" - ")[0])
+            except:
+                return await update.message.reply_text("❌ Ошибка")
 
             quiz = conn.execute(
                 "SELECT * FROM quizzes WHERE id=?",
                 (quiz_id,)
             ).fetchone()
 
-            if quiz:
-                USER[uid] = {
-                    "quiz_id": quiz_id,
-                    "q": 0,
-                    "score": 0
-                }
+            if not quiz:
+                return await update.message.reply_text("❌ Нет викторины")
 
-                await update.message.reply_text(
-                    f"📖 {quiz['description']}\n\n▶ Начинаем!",
-                    reply_markup=ReplyKeyboardRemove()
-                )
+            USER[uid] = {
+                "quiz_id": quiz_id,
+                "q": 0,
+                "score": 0,
+                "answer": None
+            }
 
-                await send_question(update, context)
-                return
+            await update.message.reply_text(
+                f"📖 {quiz['description']}\n\n▶ Старт!",
+                reply_markup=ReplyKeyboardRemove()
+            )
 
-        await update.message.reply_text("Выбери викторину через /start")
-        return
+            await send_question(update, context)
+            return
 
-    # ответы
+        return await update.message.reply_text("👉 нажми /start")
+
     await handle_answer(update, context)
 
 
@@ -162,16 +192,19 @@ async def send_question(update, context):
     uid = update.effective_user.id
     state = USER[uid]
 
-    qs = get_questions(state["quiz_id"])
+    questions = get_questions(state["quiz_id"])
 
-    if state["q"] >= len(qs):
+    if state["q"] >= len(questions):
         return await finish_quiz(update, context)
 
-    q = qs[state["q"]]
-
+    q = questions[state["q"]]
     state["answer"] = q["answer"]
 
-    options = json.loads(q["options"])
+    try:
+        options = json.loads(q["options"])
+    except:
+        options = []
+
     kb = ReplyKeyboardMarkup([[o] for o in options], resize_keyboard=True)
 
     if q["photo"]:
@@ -180,26 +213,32 @@ async def send_question(update, context):
         await update.message.reply_text(q["question"], reply_markup=kb)
 
 
+# =====================
+# ANSWERS
+# =====================
+
 async def handle_answer(update, context):
     uid = update.effective_user.id
-    state = USER[uid]
+    state = USER.get(uid)
     text = get_text(update)
 
-    if not text:
+    if not state:
         return
 
-    if text.lower() == state["answer"].lower():
+    correct = state.get("answer")
+
+    if correct and text.strip().lower() == correct.strip().lower():
         state["score"] += 1
         await update.message.reply_text("✅ Верно")
     else:
-        await update.message.reply_text(f"❌ Неверно\nОтвет: {state['answer']}")
+        await update.message.reply_text(f"❌ Неверно\nОтвет: {correct}")
 
     state["q"] += 1
     await send_question(update, context)
 
 
 # =====================
-# FINISH + STATS
+# FINISH
 # =====================
 
 def save_stats(uid, score):
@@ -210,19 +249,17 @@ def save_stats(uid, score):
         games = games + 1,
         score = score + excluded.score
     """, (uid, score))
-
     conn.commit()
 
 
 async def finish_quiz(update, context):
     uid = update.effective_user.id
-    state = USER[uid]
+    state = USER.pop(uid, None)
 
-    score = state["score"]
+    if not state:
+        return
 
-    save_stats(uid, score)
-
-    del USER[uid]
+    save_stats(uid, state["score"])
 
     kb = ReplyKeyboardMarkup(
         [["📚 Выбрать другую викторину"]],
@@ -230,134 +267,136 @@ async def finish_quiz(update, context):
     )
 
     await update.message.reply_text(
-        f"""🏁 ВИКТОРИНА ЗАВЕРШЕНА
+        f"""🏁 Готово!
 
-Ваш результат: {score}
+🎯 Результат: {state['score']}
 
-━━━━━━━━━━━━""",
+━━━━━━━━━━
+📲 TG: {TG_CHANNEL}
+📘 VK: {VK_PAGE}
+""",
         reply_markup=kb
     )
 
 
 # =====================
-# ADMIN
+# ADMIN MENU
 # =====================
 
 async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
 
     if not is_admin(uid):
-        await update.message.reply_text("Нет доступа")
-        return
+        return await update.message.reply_text("❌ нет доступа")
 
     ADMIN[uid] = {"mode": "menu"}
 
     await update.message.reply_text("""
-🛠 ADMIN
+🛠 АДМИН
 
 1 - создать викторину
-2 - список
-3 - выйти
+2 - список викторин
+3 - выход
 4 - добавить вопрос
-""")
+5 - удалить вопрос
+6 - редактировать вопрос
+""", reply_markup=ReplyKeyboardRemove())
 
 
-async def admin_router(update):
+# =====================
+# ADMIN ROUTER
+# =====================
+
+async def admin_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     text = get_text(update)
-    st = ADMIN[uid]
+    st = ADMIN.get(uid)
 
-    # MENU
-    if st["mode"] == "menu":
+    if not st:
+        return
+
+    mode = st["mode"]
+
+    # ========= MENU =========
+    if mode == "menu":
 
         if text == "1":
             st["mode"] = "create_quiz"
-            await update.message.reply_text("Название викторины:")
-            return
+            return await update.message.reply_text("Название?")
 
         if text == "2":
             qs = get_quizzes()
-            msg = "📚 Викторины:\n\n"
-            for q in qs:
-                msg += f"{q['id']} - {q['name']}\n"
-            await update.message.reply_text(msg)
-            return
+            msg = "\n".join([f"{q['id']} - {q['name']}" for q in qs])
+            return await update.message.reply_text(msg or "пусто")
 
         if text == "3":
-            ADMIN.pop(uid)
-            await update.message.reply_text("Выход")
-            return
+            ADMIN.pop(uid, None)
+            return await update.message.reply_text("выход")
 
         if text == "4":
-            st["mode"] = "add_question_quiz"
-            await update.message.reply_text("ID викторины:")
-            return
+            st["mode"] = "add_quiz_id"
+            return await update.message.reply_text("ID викторины?")
 
-    # CREATE QUIZ
-    if st["mode"] == "create_quiz":
-        conn.execute(
-            "INSERT INTO quizzes(name, description) VALUES (?,?)",
-            (text, "Описание викторины")
-        )
+        if text == "5":
+            st["mode"] = "delete"
+            return await update.message.reply_text("ID викторины для удаления вопроса?")
+
+        if text == "6":
+            st["mode"] = "edit_qid"
+            return await update.message.reply_text("ID викторины для редактирования?")
+
+    # ========= CREATE =========
+    if mode == "create_quiz":
+        conn.execute("INSERT INTO quizzes(name) VALUES (?)", (text,))
         conn.commit()
-
         st["mode"] = "menu"
-        await update.message.reply_text("✔ Создано")
+        return await update.message.reply_text("создано")
 
-    # ADD QUESTION FLOW
-    if st["mode"] == "add_question_quiz":
+    # ========= ADD QUESTION =========
+    if mode == "add_quiz_id":
         st["quiz_id"] = int(text)
-        st["mode"] = "add_question_text"
-        await update.message.reply_text("Вопрос:")
-        return
+        st["mode"] = "add_q"
+        return await update.message.reply_text("вопрос?")
 
-    if st["mode"] == "add_question_text":
+    if mode == "add_q":
         st["question"] = text
-        st["mode"] = "add_question_photo"
-        await update.message.reply_text("Отправь фото или напиши 'нет'")
-        return
-
-    if st["mode"] == "add_question_photo":
-
-        if update.message.photo:
-            st["photo"] = update.message.photo[-1].file_id
-        else:
-            st["photo"] = None
-
         st["mode"] = "add_options"
-        await update.message.reply_text("Варианты через запятую:")
-        return
+        return await update.message.reply_text("варианты через ,")
 
-    if st["mode"] == "add_options":
-        st["options"] = json.dumps(text.split(","))
+    if mode == "add_options":
+        st["options"] = json.dumps([x.strip() for x in text.split(",")])
         st["mode"] = "add_answer"
-        await update.message.reply_text("Правильный ответ:")
-        return
+        return await update.message.reply_text("ответ?")
 
-    if st["mode"] == "add_answer":
+    if mode == "add_answer":
         conn.execute("""
-            INSERT INTO questions(quiz_id, question, options, answer, photo)
-            VALUES (?,?,?,?,?)
-        """, (
-            st["quiz_id"],
-            st["question"],
-            st["options"],
-            text,
-            st.get("photo")
-        ))
-
+            INSERT INTO questions(quiz_id, question, options, answer)
+            VALUES (?,?,?,?)
+        """, (st["quiz_id"], st["question"], st["options"], text))
         conn.commit()
-
         st["mode"] = "menu"
-        await update.message.reply_text("✔ Вопрос добавлен")
+        return await update.message.reply_text("готово")
 
+    # ========= EDIT =========
+    if mode == "edit_qid":
+        st["edit_qid"] = int(text)
+        st["mode"] = "edit_select"
+        return await update.message.reply_text("что менять? question/options/answer")
 
-# =====================
-# BACK BUTTON
-# =====================
+    if mode == "edit_select":
+        st["field"] = text
+        st["mode"] = "edit_value"
+        return await update.message.reply_text("новое значение?")
 
-async def back_to_quizzes(update, context):
-    return await start(update, context)
+    if mode == "edit_value":
+        conn.execute(f"""
+            UPDATE questions
+            SET {st['field']}=?
+            WHERE id=?
+        """, (text, st["edit_qid"]))
+        conn.commit()
+        st["mode"] = "menu"
+        return await update.message.reply_text("обновлено")
 
 
 # =====================
